@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import functools
 import inspect
 import io
@@ -20,7 +21,9 @@ import logging
 import os.path
 import pathlib
 import sys
+import threading
 import types
+import uuid
 
 from inspect import signature
 from typing import Callable, Type
@@ -61,6 +64,28 @@ class _LoggingHandler(io.TextIOWrapper):
     def write(self, out):
         payload = dict(severity=self.level, message=out.rstrip("\n"))
         return self.stderr.write(json.dumps(payload) + "\n")
+
+
+class _LoggingHandlerAddExecutionId(io.TextIOWrapper):
+    def __init__(self, stream=sys.stdout):
+        io.TextIOWrapper.__init__(self, io.StringIO(), encoding=stream.encoding)
+        self.stream = stream
+
+    def write(self, contents):
+        if contents == '\n':
+            return
+        execution_id = get_execution_id()
+        if execution_id is None:
+            self.stream.write(contents + "\n")
+            self.stream.flush()
+        try:
+            payload = json.loads(contents)
+        except json.JSONDecodeError as e:
+            payload = {'message': contents}
+        payload['logging.googleapis.com/labels'] = payload.get('logging.googleapis.com/labels', {})
+        payload['logging.googleapis.com/labels']['execution_id'] = get_execution_id()
+        self.stream.write(json.dumps(payload) + "\n")
+        self.stream.flush()
 
 
 def cloud_event(func: CloudEventFunction) -> CloudEventFunction:
@@ -244,6 +269,7 @@ def _configure_app(app, function, signature_type):
         app.view_functions["run"] = _http_view_func_wrapper(function, flask.request)
         app.view_functions["error"] = lambda: flask.abort(404, description="Not Found")
         app.after_request(read_request)
+        app.after_request(clear_execution_id)
     elif signature_type == _function_registry.BACKGROUNDEVENT_SIGNATURE_TYPE:
         app.url_map.add(
             werkzeug.routing.Rule(
@@ -314,6 +340,27 @@ def crash_handler(e):
     """
     return str(e), 500, {_FUNCTION_STATUS_HEADER_FIELD: _CRASH}
 
+def _thread_local():
+    flask.g._thread_storage = getattr(flask.g, '_thread_storage') if hasattr(flask.g, '_thread_storage') else threading.local()
+    return flask.g._thread_storage
+
+
+def clear_execution_id(response):
+    _thread_local().execution_id = None
+    return response
+
+def get_execution_id():
+    return getattr(_thread_local(), 'execution_id', None)
+
+
+def _execution_id_wrapper(fn=None):
+    def _wrapper(request, *args, **kwargs):
+        _thread_local().execution_id = f'{uuid.uuid4().hex[-12:]}'  # TODO generate execution id
+        with contextlib.redirect_stdout(_LoggingHandlerAddExecutionId(sys.stdout)), contextlib.redirect_stderr(_LoggingHandlerAddExecutionId(sys.stderr)):
+            return fn(request, *args, **kwargs)
+    return _wrapper
+
+
 
 def create_app(target=None, source=None, signature_type=None):
     target = _function_registry.get_function_target(target)
@@ -354,14 +401,13 @@ def create_app(target=None, source=None, signature_type=None):
         sys.stdout = _LoggingHandler("INFO", sys.stderr)
         sys.stderr = _LoggingHandler("ERROR", sys.stderr)
         setup_logging()
-
     # Execute the module, within the application context
     with _app.app_context():
         try:
             spec.loader.exec_module(source_module)
-            function = _function_registry.get_user_function(
+            function = _execution_id_wrapper(_function_registry.get_user_function(
                 source, source_module, target
-            )
+            ))
         except Exception as e:
             if werkzeug.serving.is_running_from_reloader():
                 # When reloading, print out the error immediately, but raise
